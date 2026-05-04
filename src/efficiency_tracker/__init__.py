@@ -12,7 +12,7 @@ from aqt import mw, gui_hooks
 from aqt.qt import (
     QAction, QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QDoubleSpinBox, QDialogButtonBox, QDateEdit, QDate, Qt,
-    QWebEngineView,
+    QWebEngineView, QTimer,
 )
 from aqt.utils import qconnect, tooltip, showInfo
 
@@ -633,9 +633,20 @@ class StatsDialog(QDialog):
             self.refresh()
 
 
-def show_stats():
+def _open_stats_dialog():
     dialog = StatsDialog(mw)
     dialog.exec()
+
+
+def show_stats():
+    # Defer the dialog opening by one event-loop tick. This is essential
+    # when invoked from the top toolbar: the toolbar link click runs inside
+    # a webview bridge callback, and opening a modal dialog with another
+    # webview from within that nested context causes QtWebEngine to fail
+    # to render the page (the dialog appears blank/transparent). Deferring
+    # ensures the bridge callback returns first, then the dialog opens in
+    # a clean event-loop state.
+    QTimer.singleShot(0, _open_stats_dialog)
 
 
 # ---------- Top toolbar button ----------
