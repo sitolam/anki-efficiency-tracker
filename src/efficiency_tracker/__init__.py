@@ -12,9 +12,9 @@ from aqt import mw, gui_hooks
 from aqt.qt import (
     QAction, QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QDoubleSpinBox, QDialogButtonBox, QDateEdit, QDate, Qt,
-    QWebEngineView, QTimer,
+    QWebEngineView, QTimer, QComboBox, QFileDialog,
 )
-from aqt.utils import qconnect, tooltip, showInfo
+from aqt.utils import qconnect, tooltip, showInfo, askUser
 
 ADDON_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.path.join(ADDON_DIR, "user_data.json")
@@ -24,7 +24,11 @@ DEFAULT_CONFIG = {
     "good_threshold": 70,
     "warn_threshold": 45,
     "show_toolbar_button": True,
+    "range_days": 30,
 }
+
+RANGE_OPTIONS = [(7, "Last 7 days"), (30, "Last 30 days"),
+                 (90, "Last 90 days"), (365, "Last 365 days")]
 
 # Cycle order for the in-dashboard theme toggle button.
 THEME_CYCLE = ["auto", "light", "dark"]
@@ -186,6 +190,109 @@ def show_input_dialog():
     dialog.exec()
 
 
+# ---------- Export / import ----------
+
+def _extract_data_dict(payload):
+    """Accept either {version, data: {...}} or a raw {date: {attempted: n}} dict."""
+    if isinstance(payload, dict) and "data" in payload and "version" in payload:
+        return payload["data"]
+    if isinstance(payload, dict):
+        return payload
+    return None
+
+
+def _filter_valid_entries(raw):
+    """Keep only entries that look like {YYYY-MM-DD: {"attempted": number}}."""
+    valid = {}
+    if not isinstance(raw, dict):
+        return valid
+    for k, v in raw.items():
+        if not isinstance(k, str):
+            continue
+        try:
+            datetime.strptime(k, "%Y-%m-%d")
+        except ValueError:
+            continue
+        if not isinstance(v, dict):
+            continue
+        att = v.get("attempted")
+        if not isinstance(att, (int, float)):
+            continue
+        valid[k] = {"attempted": float(att)}
+    return valid
+
+
+def show_export_dialog():
+    default_name = f"efficiency_tracker_export_{datetime.now().strftime('%Y%m%d')}.json"
+    path, _ = QFileDialog.getSaveFileName(
+        mw, "Export efficiency data", default_name, "JSON files (*.json)"
+    )
+    if not path:
+        return
+    if not path.lower().endswith(".json"):
+        path += ".json"
+
+    data = load_data()
+    payload = {
+        "version": 1,
+        "addon": "efficiency_tracker",
+        "exported_at": datetime.now().isoformat(timespec="seconds"),
+        "data": data,
+    }
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+    except IOError as e:
+        showInfo(f"Could not write export file:\n{e}")
+        return
+
+    tooltip(f"Exported {len(data)} entries to {os.path.basename(path)}")
+
+
+def show_import_dialog():
+    path, _ = QFileDialog.getOpenFileName(
+        mw, "Import efficiency data", "", "JSON files (*.json);;All files (*.*)"
+    )
+    if not path:
+        return
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except (IOError, json.JSONDecodeError) as e:
+        showInfo(f"Could not read file:\n{e}")
+        return
+
+    raw = _extract_data_dict(payload)
+    if raw is None:
+        showInfo("File format not recognised — expected a JSON object.")
+        return
+
+    incoming = _filter_valid_entries(raw)
+    if not incoming:
+        showInfo("File contained no valid entries.")
+        return
+
+    existing = load_data()
+    overlap = sum(1 for k in incoming if k in existing)
+    new_count = len(incoming) - overlap
+
+    msg = (
+        f"Found {len(incoming)} valid entries in the import file.\n\n"
+        f"  • {new_count} new\n"
+        f"  • {overlap} will overwrite existing entries\n\n"
+        f"Imported values win on conflicts. Continue?"
+    )
+    if not askUser(msg, parent=mw, title="Import efficiency data"):
+        return
+
+    merged = dict(existing)
+    merged.update(incoming)
+    save_data(merged)
+
+    tooltip(f"Imported {len(incoming)} entries ({new_count} new, {overlap} updated)")
+
+
 # ---------- Stats dialog ----------
 
 def _eff_class(eff, good_threshold, warn_threshold):
@@ -202,11 +309,12 @@ def _eff_str(eff):
     return f"{eff:.0f}%" if eff is not None else "—"
 
 
-def build_stats_html(num_days=30):
+def build_stats_html():
     config = get_config()
     theme = config.get("theme", "auto")
     good_threshold = config.get("good_threshold", 70)
     warn_threshold = config.get("warn_threshold", 45)
+    num_days = config.get("range_days", 30)
 
     data = load_data()
     days = []
@@ -254,7 +362,17 @@ def build_stats_html(num_days=30):
 
     n = len(days)
     group_w = inner_w / n
-    bar_w = group_w * 0.38
+    # For large ranges, narrow bars and reduce inter-bar gap so bars stay
+    # visible without overlapping the next group.
+    if n > 90:
+        bar_w = group_w * 0.45
+        bar_gap = 0.2
+    elif n > 30:
+        bar_w = group_w * 0.42
+        bar_gap = 0.5
+    else:
+        bar_w = group_w * 0.38
+        bar_gap = 1
 
     # Generate bars
     bars_svg = []
@@ -266,11 +384,11 @@ def build_stats_html(num_days=30):
         rh = (d["actual"] / y_max) * inner_h if y_max > 0 else 0
         ry = pad_t + inner_h - rh
         bars_svg.append(
-            f'<rect x="{gx - bar_w - 1:.1f}" y="{ay:.1f}" width="{bar_w:.1f}" height="{ah:.1f}" '
+            f'<rect x="{gx - bar_w - bar_gap:.2f}" y="{ay:.1f}" width="{bar_w:.2f}" height="{ah:.1f}" '
             f'fill="var(--warn)" rx="2"><title>{d["date"]}: {d["attempted"]} min attempted</title></rect>'
         )
         bars_svg.append(
-            f'<rect x="{gx + 1:.1f}" y="{ry:.1f}" width="{bar_w:.1f}" height="{rh:.1f}" '
+            f'<rect x="{gx + bar_gap:.2f}" y="{ry:.1f}" width="{bar_w:.2f}" height="{rh:.1f}" '
             f'fill="var(--accent)" rx="2"><title>{d["date"]}: {d["actual"]} min active</title></rect>'
         )
         if i % max(1, n // 10) == 0 or i == n - 1:
@@ -358,9 +476,10 @@ def build_stats_html(num_days=30):
                 f'<text x="{gx:.1f}" y="{eff_chart_h - 22:.0f}" text-anchor="middle" class="axis-label">{d["label"]}</text>'
             )
 
-    # History table (last 14 days, most recent first)
+    # History table — show recent entries, capped so the table stays readable
+    history_count = min(num_days, 30) if num_days >= 14 else num_days
     history_rows = []
-    for d in reversed(days[-14:]):
+    for d in reversed(days[-history_count:]):
         eff_text = _eff_str(d["efficiency"])
         eff_cls = _eff_class(d["efficiency"], good_threshold, warn_threshold)
         history_rows.append(f"""
@@ -487,7 +606,7 @@ tr:last-child td {{ border-bottom: none; }}
 </head>
 <body>
 <h1>📊 Efficiency Tracker</h1>
-<p class="subtitle">Actual study time in Anki vs. time attempted to study — last 30 days</p>
+<p class="subtitle">Actual study time in Anki vs. time attempted to study — last {num_days} days</p>
 
 <div class="stats">
   <div class="stat-card">
@@ -548,7 +667,7 @@ tr:last-child td {{ border-bottom: none; }}
 </div>
 
 <div class="chart-card">
-  <div class="chart-title" style="margin-bottom: 10px;">Recent history (14 days)</div>
+  <div class="chart-title" style="margin-bottom: 10px;">Recent history ({history_count} days)</div>
   <table>
     <thead>
       <tr>
@@ -592,6 +711,20 @@ class StatsDialog(QDialog):
         btn_refresh.clicked.connect(self.refresh)
         btn_row.addWidget(btn_refresh)
 
+        # Range selector — switches the time window for the dashboard.
+        btn_row.addSpacing(8)
+        btn_row.addWidget(QLabel("Range:"))
+        self.range_combo = QComboBox()
+        for days, label in RANGE_OPTIONS:
+            self.range_combo.addItem(label, days)
+        current_days = get_config().get("range_days", 30)
+        for i in range(self.range_combo.count()):
+            if self.range_combo.itemData(i) == current_days:
+                self.range_combo.setCurrentIndex(i)
+                break
+        self.range_combo.currentIndexChanged.connect(self.on_range_changed)
+        btn_row.addWidget(self.range_combo)
+
         btn_row.addStretch()
 
         # Theme toggle — cycles auto → light → dark and persists to config.
@@ -622,6 +755,15 @@ class StatsDialog(QDialog):
         cfg["theme"] = nxt
         save_config(cfg)
         self._refresh_theme_label()
+        self.refresh()
+
+    def on_range_changed(self, idx):
+        new_days = self.range_combo.itemData(idx)
+        if new_days is None:
+            return
+        cfg = get_config()
+        cfg["range_days"] = new_days
+        save_config(cfg)
         self.refresh()
 
     def refresh(self):
@@ -694,6 +836,16 @@ def setup_menu():
     action_stats.setShortcut("Ctrl+Shift+S")
     qconnect(action_stats.triggered, show_stats)
     menu.addAction(action_stats)
+
+    menu.addSeparator()
+
+    action_export = QAction("📤 Export data…", mw)
+    qconnect(action_export.triggered, show_export_dialog)
+    menu.addAction(action_export)
+
+    action_import = QAction("📥 Import data…", mw)
+    qconnect(action_import.triggered, show_import_dialog)
+    menu.addAction(action_import)
 
 
 setup_menu()

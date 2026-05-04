@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] — 2026-05-04
+
+### Added
+- **Configurable time range** — view the last 7, 30, 90, or 365 days from
+  a new dropdown in the dashboard. The choice persists via the new
+  `range_days` config key
+- **Export data** (Tools → Efficiency Tracker → Export data…) — save your
+  attempted-time entries to a JSON file
+- **Import data** (Tools → Efficiency Tracker → Import data…) — load
+  entries from a JSON export, with a confirmation prompt showing how many
+  entries are new vs. overwritten
+
+### Changed
+- History table size now scales with the selected range (caps at 30)
+- Bar widths and gaps adapt to the range so 90- and 365-day views remain
+  legible
+- Dashboard subtitle reflects the current range ("last N days")
+
 ## [1.0.0] — 2026-05-04
 
 Initial release.

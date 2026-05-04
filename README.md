@@ -39,12 +39,15 @@ your recent history.
 - 📈 Bar chart per day (attempted vs. active in Anki)
 - 📉 Line chart of efficiency, colour-coded by threshold (defaults: ≥ 70%
   green, 45–69% amber, < 45% red — fully configurable)
-- 🗂️ Table with the last 14 days
+- 🗂️ History table of recent days
+- 📅 Configurable time range — view the last **7, 30, 90, or 365 days**
+- 📤 **Export / 📥 Import** your attempted-time data as JSON, for
+  back-ups or rough cross-device sync
 - ⌨️ Keyboard shortcuts: `Ctrl+Shift+E` to enter time, `Ctrl+Shift+S` for
   statistics
 - 🌓 Theme cycle button in the dashboard (auto / light / dark) — also
   settable via the add-on config
-- 📦 Zero external dependencies — all charts in pure SVG, ~6 KB total
+- 📦 Zero external dependencies — all charts in pure SVG, ~7 KB total
 - 🔌 Works fully offline
 
 ## Installation
@@ -79,12 +82,14 @@ Copy the `src/efficiency_tracker/` folder into your Anki addons directory:
 ## Usage
 
 After installing, a new menu **Tools → Efficiency Tracker** appears with
-two actions:
+these actions:
 
 | Action                       | Shortcut         | What it does                                                |
 |------------------------------|------------------|-------------------------------------------------------------|
 | ➕ Enter study time…        | `Ctrl+Shift+E`   | Log how many minutes you attempted to study on a given day  |
 | 📊 Show statistics…         | `Ctrl+Shift+S`   | Open the dashboard                                          |
+| 📤 Export data…             |                  | Save your attempted-time entries to a JSON file             |
+| 📥 Import data…             |                  | Load entries from a JSON export (merged with existing data) |
 
 The input dialog has a date picker so you can also back-fill earlier days.
 It immediately shows your actual Anki study time for the chosen day, so
@@ -99,7 +104,22 @@ Open **Tools → Add-ons → Efficiency Tracker → Config** to tune:
 | `theme` | `"auto"` | `"auto"` (follow system), `"dark"`, or `"light"`. Also cycleable from the dashboard. |
 | `good_threshold` | `70` | Efficiency % at which the indicator turns green |
 | `warn_threshold` | `45` | Below this %, indicator turns red. Between this and `good_threshold` it's amber |
+| `range_days` | `30` | Time window for the dashboard. One of `7`, `30`, `90`, or `365`. Also changeable from the range dropdown in the dashboard. |
 | `show_toolbar_button` | `true` | Show the "Efficiency" link in Anki's top toolbar (restart Anki after changing) |
+
+## Cross-device sync (export / import)
+
+Anki itself doesn't sync the addon's `user_data.json`, so attempted-time
+entries stay local to each machine. To copy data between devices:
+
+1. On device A: **Tools → Efficiency Tracker → Export data…** — saves a
+   JSON file you can put in Dropbox / iCloud / a USB drive
+2. On device B: **Tools → Efficiency Tracker → Import data…** — pick the
+   file. Existing entries with matching dates are overwritten by the
+   imported values; entries that exist only locally are kept.
+
+The export format is a simple JSON object with a `data` field, so you can
+also hand-edit it or generate it from scripts if you want to.
 
 ## How it works
 
@@ -118,9 +138,10 @@ Open **Tools → Add-ons → Efficiency Tracker → Config** to tune:
 
 ## Known limitations
 
-- Statistics always show the last 30 days (configurable range coming).
-- No cross-device sync — `user_data.json` stays local. To share across
-  machines you can sync the add-on folder via iCloud, Dropbox, etc.
+- Very long ranges (365 days) render daily bars at high density — use the
+  efficiency line chart for trends in that mode.
+- No automatic cross-device sync — use **Export data / Import data** in the
+  Tools menu, or sync the add-on folder via iCloud / Dropbox manually.
 
 ## Contributing
 
@@ -128,9 +149,8 @@ Issues and pull requests are welcome. Some ideas on the roadmap:
 
 - Note field per day (why was efficiency low?)
 - Streak counter for consecutive days at ≥ X% efficiency
-- Configurable time range (7 / 30 / 90 / 365 days)
-- CSV export
 - Per-week or per-month efficiency targets
+- Aggregated views (weekly / monthly bars) for very long ranges
 
 ## License
 
