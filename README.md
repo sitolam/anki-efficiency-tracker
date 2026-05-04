@@ -32,7 +32,8 @@ your recent history.
 
 ## Features
 
-- ➕ Quick input of attempted study time, with a date picker for back-filling
+- ➕ **Log study time as sessions** — add multiple time blocks per day
+  (09:00 → 10:00, 14:30 → 15:00, etc.) or just a duration in minutes
 - 📊 Dashboard with today's efficiency, 7-day average, and 30-day average
 - 🔘 Toolbar button right next to Anki's built-in "Stats" — one click to
   open the dashboard
@@ -43,11 +44,11 @@ your recent history.
 - 📅 Configurable time range — view the last **7, 30, 90, or 365 days**
 - 📤 **Export / 📥 Import** your attempted-time data as JSON, for
   back-ups or rough cross-device sync
-- ⌨️ Keyboard shortcuts: `Ctrl+Shift+E` to enter time, `Ctrl+Shift+S` for
+- ⌨️ Keyboard shortcuts: `Ctrl+Shift+E` to log time, `Ctrl+Shift+S` for
   statistics
 - 🌓 Theme cycle button in the dashboard (auto / light / dark) — also
   settable via the add-on config
-- 📦 Zero external dependencies — all charts in pure SVG, ~7 KB total
+- 📦 Zero external dependencies — all charts in pure SVG, ~9 KB total
 - 🔌 Works fully offline
 
 ## Installation
@@ -86,14 +87,27 @@ these actions:
 
 | Action                       | Shortcut         | What it does                                                |
 |------------------------------|------------------|-------------------------------------------------------------|
-| ➕ Enter study time…        | `Ctrl+Shift+E`   | Log how many minutes you attempted to study on a given day  |
+| ➕ Enter study time…        | `Ctrl+Shift+E`   | Open the per-day session log (add/remove timed sessions)   |
 | 📊 Show statistics…         | `Ctrl+Shift+S`   | Open the dashboard                                          |
 | 📤 Export data…             |                  | Save your attempted-time entries to a JSON file             |
 | 📥 Import data…             |                  | Load entries from a JSON export (merged with existing data) |
 
-The input dialog has a date picker so you can also back-fill earlier days.
-It immediately shows your actual Anki study time for the chosen day, so
-you see the resulting efficiency the moment you enter a value.
+### Logging a session
+
+Open **Enter study time…** and click **➕ Add session**. Two modes:
+
+- **Timed** — enter a *from* and *to* time (e.g., 09:00 → 10:30). The
+  duration is computed automatically. Sessions that cross midnight are
+  detected and marked as overnight.
+- **Just minutes** — enter a duration without specific times. Useful for
+  back-filling old data when you don't remember exactly when you studied.
+
+Add as many sessions as you want for the same day — they all add up to
+the day's total attempted time. Remove individual sessions with the ✕
+button. Changes are saved immediately.
+
+The dialog has a date picker so you can also back-fill earlier days, and
+shows your actual Anki time and live efficiency for the selected date.
 
 ## Configuration
 
@@ -127,7 +141,10 @@ also hand-edit it or generate it from scripts if you want to.
   data Anki's own statistics use). The day boundary follows your Anki
   rollover setting (4 AM by default).
 - **Attempted time** is stored in `user_data.json` inside the add-on
-  folder. One file, human-readable JSON, easy to back up or edit by hand.
+  folder. Each day is either a list of sessions
+  (`{"sessions": [{"start": "09:00", "end": "10:00", "minutes": 60}, …]}`)
+  or, for entries from older versions, a plain `{"attempted": N}`. Both
+  formats are read transparently.
 - **Visualisation** is generated as pure SVG inside an Anki webview. No
   Chart.js, no CDN, no tracking — works offline.
 

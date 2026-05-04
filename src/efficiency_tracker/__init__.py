@@ -13,6 +13,8 @@ from aqt.qt import (
     QAction, QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QDoubleSpinBox, QDialogButtonBox, QDateEdit, QDate, Qt,
     QWebEngineView, QTimer, QComboBox, QFileDialog,
+    QTimeEdit, QTime, QSpinBox, QRadioButton, QScrollArea, QWidget,
+    QFormLayout,
 )
 from aqt.utils import qconnect, tooltip, showInfo, askUser
 
@@ -108,81 +110,328 @@ def get_study_minutes_for_date(date_str):
         return 0.0
 
 
+# ---------- Session helpers ----------
+
+def compute_attempted_minutes(entry):
+    """Total attempted minutes from a data entry, supporting both formats:
+    - new: {"sessions": [{minutes, ?start, ?end}, ...]}
+    - legacy: {"attempted": N}
+    """
+    if not isinstance(entry, dict):
+        return 0
+    sessions = entry.get("sessions")
+    if isinstance(sessions, list) and sessions:
+        total = 0
+        for s in sessions:
+            if isinstance(s, dict):
+                m = s.get("minutes", 0)
+                if isinstance(m, (int, float)):
+                    total += m
+        return total
+    return entry.get("attempted", 0)
+
+
+def get_sessions_for_date(date_str):
+    """Return the list of sessions for a date. Auto-converts a legacy
+    'attempted' entry to a single untimed session for editing purposes."""
+    data = load_data()
+    entry = data.get(date_str, {})
+    sessions = entry.get("sessions")
+    if isinstance(sessions, list) and sessions:
+        return list(sessions)
+    legacy = entry.get("attempted", 0)
+    if legacy > 0:
+        return [{"minutes": float(legacy)}]
+    return []
+
+
+def write_sessions_for_date(date_str, sessions):
+    """Persist a list of sessions for a date. Removes the day entry entirely
+    if the list is empty. Always also writes the computed 'attempted' total
+    so that legacy readers (and simpler exports) keep working."""
+    data = load_data()
+    if not sessions:
+        if date_str in data:
+            del data[date_str]
+        save_data(data)
+        return
+    total = sum(s.get("minutes", 0) for s in sessions if isinstance(s, dict))
+    data[date_str] = {
+        "sessions": sessions,
+        "attempted": total,
+    }
+    save_data(data)
+
+
+def compute_session_minutes(start_str, end_str):
+    """Duration in minutes between two HH:MM strings. Wraps to next day
+    if end is before start (i.e., session ran past midnight)."""
+    try:
+        sh, sm = map(int, start_str.split(":"))
+        eh, em = map(int, end_str.split(":"))
+    except (ValueError, AttributeError):
+        return 0
+    duration = (eh * 60 + em) - (sh * 60 + sm)
+    if duration < 0:
+        duration += 24 * 60
+    return duration
+
+
+# ---------- Add-session dialog ----------
+
+class AddSessionDialog(QDialog):
+    """Sub-dialog for adding a single session — either timed (start/end)
+    or untimed (just a duration in minutes)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Add study session")
+        self.resize(360, 240)
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        # Mode selector
+        self.timed_radio = QRadioButton("Timed (from / to)")
+        self.timed_radio.setChecked(True)
+        self.bulk_radio = QRadioButton("Just minutes (no specific times)")
+        layout.addWidget(self.timed_radio)
+        layout.addWidget(self.bulk_radio)
+
+        # Timed mode inputs
+        self.timed_widget = QWidget()
+        timed_form = QFormLayout(self.timed_widget)
+        timed_form.setContentsMargins(20, 6, 0, 6)
+        now = QTime.currentTime()
+        self.start_edit = QTimeEdit(now.addSecs(-30 * 60))
+        self.start_edit.setDisplayFormat("HH:mm")
+        self.end_edit = QTimeEdit(now)
+        self.end_edit.setDisplayFormat("HH:mm")
+        self.duration_label = QLabel()
+        self.duration_label.setStyleSheet("font-weight: bold;")
+        timed_form.addRow("From:", self.start_edit)
+        timed_form.addRow("To:", self.end_edit)
+        timed_form.addRow("Duration:", self.duration_label)
+        layout.addWidget(self.timed_widget)
+
+        # Bulk mode input
+        self.bulk_widget = QWidget()
+        bulk_form = QFormLayout(self.bulk_widget)
+        bulk_form.setContentsMargins(20, 6, 0, 6)
+        self.bulk_spin = QSpinBox()
+        self.bulk_spin.setRange(1, 1440)
+        self.bulk_spin.setValue(30)
+        self.bulk_spin.setSuffix(" min")
+        self.bulk_spin.setSingleStep(5)
+        bulk_form.addRow("Minutes:", self.bulk_spin)
+        layout.addWidget(self.bulk_widget)
+        self.bulk_widget.hide()
+
+        # Wire up reactivity
+        self.timed_radio.toggled.connect(self._on_mode_changed)
+        self.start_edit.timeChanged.connect(self._update_duration)
+        self.end_edit.timeChanged.connect(self._update_duration)
+        self._update_duration()
+
+        # OK / Cancel
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.setLayout(layout)
+
+    def _on_mode_changed(self):
+        if self.timed_radio.isChecked():
+            self.timed_widget.show()
+            self.bulk_widget.hide()
+        else:
+            self.timed_widget.hide()
+            self.bulk_widget.show()
+
+    def _update_duration(self):
+        start = self.start_edit.time().toString("HH:mm")
+        end = self.end_edit.time().toString("HH:mm")
+        d = compute_session_minutes(start, end)
+        self.duration_label.setText(f"{d} min" + (" (overnight)" if d > 0 and self.end_edit.time() < self.start_edit.time() else ""))
+
+    def get_session(self):
+        """Return a session dict for the current mode, or None if invalid."""
+        if self.timed_radio.isChecked():
+            start = self.start_edit.time().toString("HH:mm")
+            end = self.end_edit.time().toString("HH:mm")
+            duration = compute_session_minutes(start, end)
+            if duration <= 0:
+                return None
+            return {"start": start, "end": end, "minutes": duration}
+        else:
+            minutes = self.bulk_spin.value()
+            if minutes <= 0:
+                return None
+            return {"minutes": float(minutes)}
+
+
 # ---------- Input dialog ----------
 
 class InputDialog(QDialog):
+    """Main dialog: shows the day's sessions, allows add/remove. Changes
+    are saved immediately (no separate Save button)."""
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Efficiency — enter study time")
-        self.resize(420, 220)
+        self.setWindowTitle("Efficiency — log study time")
+        self.resize(520, 500)
 
         layout = QVBoxLayout()
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
 
-        # Date
+        # Date row
         date_row = QHBoxLayout()
         date_row.addWidget(QLabel("Date:"))
         self.date_edit = QDateEdit(QDate.currentDate())
         self.date_edit.setCalendarPopup(True)
         self.date_edit.setDisplayFormat("yyyy-MM-dd")
         self.date_edit.setMaximumDate(QDate.currentDate())
-        self.date_edit.dateChanged.connect(self.update_display)
+        self.date_edit.dateChanged.connect(self.refresh)
         date_row.addWidget(self.date_edit)
+        date_row.addStretch()
         layout.addLayout(date_row)
 
-        # Attempted minutes
-        time_row = QHBoxLayout()
-        time_row.addWidget(QLabel("Attempted to study (min):"))
-        self.spin = QDoubleSpinBox()
-        self.spin.setRange(0, 1440)
-        self.spin.setDecimals(0)
-        self.spin.setSingleStep(5)
-        time_row.addWidget(self.spin)
-        layout.addLayout(time_row)
-
-        # Info
-        self.info_label = QLabel()
-        self.info_label.setWordWrap(True)
-        self.info_label.setStyleSheet("padding: 8px; background: rgba(0,0,0,0.05); border-radius: 6px;")
-        layout.addWidget(self.info_label)
-
-        # Buttons
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        # Stats summary
+        self.stats_label = QLabel()
+        self.stats_label.setWordWrap(True)
+        self.stats_label.setStyleSheet(
+            "padding: 10px 12px; background: rgba(128,128,128,0.10); "
+            "border-radius: 6px;"
         )
-        buttons.accepted.connect(self.save)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        layout.addWidget(self.stats_label)
+
+        # Sessions header
+        header = QHBoxLayout()
+        header.addWidget(QLabel("<b>Sessions</b>"))
+        header.addStretch()
+        btn_add = QPushButton("➕ Add session")
+        btn_add.clicked.connect(self.on_add_session)
+        header.addWidget(btn_add)
+        layout.addLayout(header)
+
+        # Scrollable sessions list
+        self.sessions_container = QWidget()
+        self.sessions_layout = QVBoxLayout(self.sessions_container)
+        self.sessions_layout.setContentsMargins(4, 4, 4, 4)
+        self.sessions_layout.setSpacing(4)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(self.sessions_container)
+        scroll.setMinimumHeight(200)
+        scroll.setStyleSheet(
+            "QScrollArea { border: 1px solid rgba(128,128,128,0.25); "
+            "border-radius: 6px; }"
+        )
+        layout.addWidget(scroll)
+
+        # Close button
+        close_row = QHBoxLayout()
+        close_row.addStretch()
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(self.accept)
+        close_row.addWidget(btn_close)
+        layout.addLayout(close_row)
 
         self.setLayout(layout)
-        self.update_display()
+        self.refresh()
 
     def current_date_str(self):
         return self.date_edit.date().toString("yyyy-MM-dd")
 
-    def update_display(self):
-        date_str = self.current_date_str()
-        data = load_data()
-        attempted = data.get(date_str, {}).get("attempted", 0)
-        self.spin.blockSignals(True)
-        self.spin.setValue(attempted)
-        self.spin.blockSignals(False)
+    def refresh(self):
+        # Clear sessions list
+        while self.sessions_layout.count():
+            item = self.sessions_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
 
+        date_str = self.current_date_str()
+        sessions = get_sessions_for_date(date_str)
+
+        if not sessions:
+            empty = QLabel("No sessions logged yet for this day.\nClick ‘Add session’ above to log one.")
+            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            empty.setStyleSheet("color: rgba(128,128,128,0.85); padding: 30px; font-style: italic;")
+            self.sessions_layout.addWidget(empty)
+        else:
+            for i, s in enumerate(sessions):
+                self.sessions_layout.addWidget(self._make_session_row(s, i))
+        self.sessions_layout.addStretch()
+
+        self._update_stats()
+
+    def _make_session_row(self, session, idx):
+        wrap = QWidget()
+        row = QHBoxLayout(wrap)
+        row.setContentsMargins(10, 6, 8, 6)
+        row.setSpacing(8)
+
+        minutes = session.get("minutes", 0)
+        if "start" in session and "end" in session:
+            text = f"<b>{session['start']}</b> → <b>{session['end']}</b>  ·  {minutes:.0f} min"
+        else:
+            text = f"<i>Untimed</i>  ·  {minutes:.0f} min"
+        label = QLabel(text)
+        label.setTextFormat(Qt.TextFormat.RichText)
+        row.addWidget(label)
+        row.addStretch()
+
+        btn = QPushButton("✕")
+        btn.setFixedWidth(32)
+        btn.setToolTip("Remove this session")
+        btn.clicked.connect(lambda _=False, i=idx: self.on_remove_session(i))
+        row.addWidget(btn)
+
+        if idx % 2 == 0:
+            wrap.setStyleSheet("background: rgba(128,128,128,0.06); border-radius: 4px;")
+        return wrap
+
+    def _update_stats(self):
+        date_str = self.current_date_str()
+        sessions = get_sessions_for_date(date_str)
+        attempted = sum(s.get("minutes", 0) for s in sessions)
         actual = get_study_minutes_for_date(date_str)
-        msg = f"Actual study time in Anki: <b>{actual:.1f} min</b>"
+        msg = (
+            f"Total attempted: <b>{attempted:.0f} min</b>"
+            f" &nbsp;·&nbsp; Active in Anki: <b>{actual:.1f} min</b>"
+        )
         if attempted > 0:
             eff = (actual / attempted) * 100
-            msg += f"<br>Current efficiency: <b>{eff:.1f}%</b>"
-        self.info_label.setText(msg)
+            msg += f" &nbsp;·&nbsp; Efficiency: <b>{eff:.1f}%</b>"
+        self.stats_label.setText(msg)
 
-    def save(self):
+    def on_add_session(self):
+        dialog = AddSessionDialog(self)
+        if dialog.exec():
+            session = dialog.get_session()
+            if session is None:
+                showInfo("Session duration must be greater than zero.")
+                return
+            date_str = self.current_date_str()
+            sessions = get_sessions_for_date(date_str)
+            sessions.append(session)
+            write_sessions_for_date(date_str, sessions)
+            self.refresh()
+
+    def on_remove_session(self, idx):
         date_str = self.current_date_str()
-        data = load_data()
-        if date_str not in data:
-            data[date_str] = {}
-        data[date_str]["attempted"] = self.spin.value()
-        save_data(data)
-        tooltip(f"Saved for {date_str}: {self.spin.value():.0f} min")
-        self.accept()
+        sessions = get_sessions_for_date(date_str)
+        if 0 <= idx < len(sessions):
+            del sessions[idx]
+            write_sessions_for_date(date_str, sessions)
+            self.refresh()
 
 
 def show_input_dialog():
@@ -202,7 +451,8 @@ def _extract_data_dict(payload):
 
 
 def _filter_valid_entries(raw):
-    """Keep only entries that look like {YYYY-MM-DD: {"attempted": number}}."""
+    """Keep only entries that look like a valid date → data mapping. Accepts
+    both legacy `{"attempted": N}` and new `{"sessions": [...]}` formats."""
     valid = {}
     if not isinstance(raw, dict):
         return valid
@@ -215,10 +465,36 @@ def _filter_valid_entries(raw):
             continue
         if not isinstance(v, dict):
             continue
+
+        # New format: validate and clean each session.
+        raw_sessions = v.get("sessions")
+        if isinstance(raw_sessions, list) and raw_sessions:
+            clean_sessions = []
+            for s in raw_sessions:
+                if not isinstance(s, dict):
+                    continue
+                m = s.get("minutes")
+                # If minutes missing but start/end present, derive it.
+                if not isinstance(m, (int, float)) and isinstance(s.get("start"), str) and isinstance(s.get("end"), str):
+                    m = compute_session_minutes(s["start"], s["end"])
+                if not isinstance(m, (int, float)) or m <= 0:
+                    continue
+                clean = {"minutes": float(m)}
+                if isinstance(s.get("start"), str) and isinstance(s.get("end"), str):
+                    clean["start"] = s["start"]
+                    clean["end"] = s["end"]
+                clean_sessions.append(clean)
+            if clean_sessions:
+                valid[k] = {
+                    "sessions": clean_sessions,
+                    "attempted": sum(s["minutes"] for s in clean_sessions),
+                }
+                continue
+
+        # Legacy fallback: plain attempted minutes.
         att = v.get("attempted")
-        if not isinstance(att, (int, float)):
-            continue
-        valid[k] = {"attempted": float(att)}
+        if isinstance(att, (int, float)) and att >= 0:
+            valid[k] = {"attempted": float(att)}
     return valid
 
 
@@ -321,7 +597,7 @@ def build_stats_html():
     for i in range(num_days - 1, -1, -1):
         d = datetime.now() - timedelta(days=i)
         date_str = d.strftime("%Y-%m-%d")
-        attempted = data.get(date_str, {}).get("attempted", 0)
+        attempted = compute_attempted_minutes(data.get(date_str, {}))
         actual = get_study_minutes_for_date(date_str)
         eff = (actual / attempted * 100) if attempted > 0 else None
         days.append({

@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] — 2026-05-04
+
+### Added
+- **Session-based time tracking** — log study time as one or more
+  sessions per day (e.g., 09:00 → 10:00 + 14:30 → 15:00) instead of a
+  single total. The redesigned input dialog shows a per-day list of
+  sessions with add / remove buttons. Each session can be either timed
+  (start + end time) or untimed ("just minutes"). Total attempted time
+  is computed automatically from the sessions
+
+### Changed
+- Input dialog redesigned around the session list — changes save
+  immediately on add / remove (no separate Save button)
+- Data format gained a `sessions` field on each day. Legacy entries with
+  only `attempted` still work, and are auto-shown as a single untimed
+  session when opened for editing
+- Import accepts both the new `sessions` format and the legacy `attempted`
+  format
+
 ## [1.1.0] — 2026-05-04
 
 ### Added
