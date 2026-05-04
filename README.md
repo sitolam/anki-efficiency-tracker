@@ -140,8 +140,13 @@ also hand-edit it or generate it from scripts if you want to.
 - **Actual study time** comes straight from Anki's `revlog` table (the same
   data Anki's own statistics use). The day boundary follows your Anki
   rollover setting (4 AM by default).
-- **Attempted time** is stored in `user_data.json` inside the add-on
-  folder. Each day is either a list of sessions
+- **Attempted time** is also bucketed into Anki-days that follow the same
+  rollover. So a session you log at 02:30 with the default 4 AM rollover
+  counts toward the *previous* calendar date — exactly how Anki itself
+  groups reviews from that moment. This keeps the efficiency calculation
+  honest around the night boundary.
+- **Storage**: `user_data.json` inside the add-on folder. Each day is
+  either a list of sessions
   (`{"sessions": [{"start": "09:00", "end": "10:00", "minutes": 60}, …]}`)
   or, for entries from older versions, a plain `{"attempted": N}`. Both
   formats are read transparently.

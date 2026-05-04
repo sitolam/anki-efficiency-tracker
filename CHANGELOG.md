@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] — 2026-05-04
+
+### Fixed
+- The "today" used by the input dialog and the dashboard now honours
+  Anki's day rollover hour (default 4 AM). Before this fix, a study
+  session logged at 02:30 was attributed to that calendar day's row
+  while Anki itself counted reviews from the same moment against the
+  previous day, leading to mismatched efficiency totals around the
+  rollover boundary.
+
 ## [1.2.0] — 2026-05-04
 
 ### Added

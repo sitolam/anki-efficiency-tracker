@@ -84,6 +84,27 @@ def get_rollover_hour():
             return 4
 
 
+def today_anki_date():
+    """Return the current Anki-day as a YYYY-MM-DD string, honouring the
+    rollover hour. If it's currently 02:30 and rollover is 4 AM, the
+    Anki-day is still yesterday's date — exactly how Anki itself counts
+    reviews."""
+    now = datetime.now()
+    rollover = get_rollover_hour()
+    if now.hour < rollover:
+        now = now - timedelta(days=1)
+    return now.strftime("%Y-%m-%d")
+
+
+def qdate_for_anki_today():
+    """QDate for Anki's current day (rollover-aware). Used as the default
+    selection / max date in the input dialog so users see the day Anki
+    is currently logging reviews against."""
+    today_str = today_anki_date()
+    y, m, d = today_str.split("-")
+    return QDate(int(y), int(m), int(d))
+
+
 def get_study_minutes_for_date(date_str):
     """Actual Anki study time in minutes for a YYYY-MM-DD date."""
     if mw.col is None:
@@ -289,13 +310,16 @@ class InputDialog(QDialog):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
 
-        # Date row
+        # Date row — defaults to Anki's current day, honouring the rollover
+        # hour. So at 02:30 with rollover=4 the dialog opens on yesterday's
+        # calendar date (which is still "today" from Anki's perspective).
         date_row = QHBoxLayout()
         date_row.addWidget(QLabel("Date:"))
-        self.date_edit = QDateEdit(QDate.currentDate())
+        anki_today = qdate_for_anki_today()
+        self.date_edit = QDateEdit(anki_today)
         self.date_edit.setCalendarPopup(True)
         self.date_edit.setDisplayFormat("yyyy-MM-dd")
-        self.date_edit.setMaximumDate(QDate.currentDate())
+        self.date_edit.setMaximumDate(anki_today)
         self.date_edit.dateChanged.connect(self.refresh)
         date_row.addWidget(self.date_edit)
         date_row.addStretch()
@@ -593,9 +617,14 @@ def build_stats_html():
     num_days = config.get("range_days", 30)
 
     data = load_data()
+    # Anchor the window to Anki's "today" — at 02:30 with rollover=4, the
+    # last bar should still be yesterday's calendar date, matching what
+    # Anki's own statistics would show.
+    today_str = today_anki_date()
+    today_dt = datetime.strptime(today_str, "%Y-%m-%d")
     days = []
     for i in range(num_days - 1, -1, -1):
-        d = datetime.now() - timedelta(days=i)
+        d = today_dt - timedelta(days=i)
         date_str = d.strftime("%Y-%m-%d")
         attempted = compute_attempted_minutes(data.get(date_str, {}))
         actual = get_study_minutes_for_date(date_str)
