@@ -1,0 +1,27 @@
+# Build output
+dist/
+*.ankiaddon
+
+# User data (per-user, never commit)
+user_data.json
+src/efficiency_tracker/user_data.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.pytest_cache/
+
+# Anki meta files (created when manually copied to addons folder)
+meta.json
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
