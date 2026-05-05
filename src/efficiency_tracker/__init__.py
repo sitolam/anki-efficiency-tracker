@@ -1418,7 +1418,13 @@ def _format_elapsed(minutes):
 
 
 def _refresh_statusbar():
-    """Pull state from the tracker and redraw both widgets."""
+    """Pull state from the tracker and redraw both widgets.
+
+    The label always shows the day's totals: total attempted minutes,
+    total Anki review minutes, and efficiency. While a live session is
+    running, its elapsed time is added on top of the saved sessions so
+    the numbers tick up live as you study.
+    """
     global _statusbar_button, _statusbar_label, _start_action_ref
     if _statusbar_button is None or _statusbar_label is None:
         return
@@ -1433,27 +1439,31 @@ def _refresh_statusbar():
         if running else "Start a live session"
     )
 
-    # --- Label: visible only while running, with the original session stats ---
-    if not running:
-        # When idle, the label still shows — but as a low-contrast hint
-        # explaining what the button does. Without this the lone ▶ icon
-        # is mysterious for first-time users.
-        _statusbar_label.setText(
-            '<span style="color:#8a8d99; font-size:11px;">'
-            'Start session'
-            '</span>'
-        )
-        _statusbar_label.setVisible(True)
+    # --- Day totals ---
+    # Anchor on the Anki-date the session started in if running, otherwise
+    # today. This keeps a session that crosses the rollover boundary
+    # (e.g. 23:30 → 00:30 with rollover=4) contributing to the same day
+    # the user thinks of as "now".
+    today_str = state["anki_date"] if running else today_anki_date()
+    data = load_data()
+    saved_attempted = compute_attempted_minutes(data.get(today_str, {}))
+    actual_today = get_study_minutes_for_date(today_str)
+
+    if running:
+        attempted_today = saved_attempted + state["elapsed_min"]
     else:
-        eff = state["efficiency"]
-        eff_str = f"{eff:.0f}%" if eff is not None else "—"
-        colour = _eff_colour(eff)
-        _statusbar_label.setText(
-            f'⏱ <b>{_format_elapsed(state["elapsed_min"])}</b>'
-            f' &nbsp;·&nbsp; {state["active_min"]:.1f} min Anki'
-            f' &nbsp;·&nbsp; <b style="color:{colour}">{eff_str}</b>'
-        )
-        _statusbar_label.setVisible(True)
+        attempted_today = saved_attempted
+
+    eff = (actual_today / attempted_today * 100) if attempted_today > 0 else None
+    eff_str = f"{eff:.0f}%" if eff is not None else "—"
+    colour = _eff_colour(eff)
+
+    _statusbar_label.setText(
+        f'⏱ <b>{attempted_today:.0f}</b> min attempted'
+        f' &nbsp;·&nbsp; <b>{actual_today:.1f}</b> min Anki'
+        f' &nbsp;·&nbsp; <b style="color:{colour}">{eff_str}</b>'
+    )
+    _statusbar_label.setVisible(True)
 
     # --- Sync the menu action label ---
     if _start_action_ref is not None:

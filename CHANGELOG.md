@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.1] — 2026-05-04
+
+### Changed
+- Statusbar label now always shows **today's totals** (attempted minutes,
+  Anki minutes, efficiency) instead of just the current session's stats.
+  While a live session is running, its elapsed time is added to the
+  saved sessions on the fly so the numbers tick up live as you study —
+  no visual jump when you stop the session
+
 ## [1.3.0] — 2026-05-04
 
 ### Added
