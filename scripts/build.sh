@@ -27,6 +27,7 @@ zip -r "$OUT" . \
     -x "__pycache__/*" \
     -x "*.pyc" \
     -x "user_data.json" \
+    -x "active_session.json" \
     -x "meta.json" \
     -x ".DS_Store"
 

@@ -5,6 +5,8 @@ dist/
 # User data (per-user, never commit)
 user_data.json
 src/efficiency_tracker/user_data.json
+active_session.json
+src/efficiency_tracker/active_session.json
 
 # Python
 __pycache__/

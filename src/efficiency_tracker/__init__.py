@@ -20,6 +20,7 @@ from aqt.utils import qconnect, tooltip, showInfo, askUser
 
 ADDON_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.path.join(ADDON_DIR, "user_data.json")
+ACTIVE_SESSION_FILE = os.path.join(ADDON_DIR, "active_session.json")
 
 DEFAULT_CONFIG = {
     "theme": "auto",
@@ -27,6 +28,7 @@ DEFAULT_CONFIG = {
     "warn_threshold": 45,
     "show_toolbar_button": True,
     "range_days": 30,
+    "notify_every_30min": True,
 }
 
 RANGE_OPTIONS = [(7, "Last 7 days"), (30, "Last 30 days"),
@@ -69,6 +71,44 @@ def save_data(data):
             json.dump(data, f, indent=2, ensure_ascii=False)
     except IOError as e:
         showInfo(f"Could not save data: {e}")
+
+
+# ---------- Active session persistence ----------
+#
+# A live session in progress is stored in active_session.json (separate from
+# user_data.json so a corrupt running-session file can't damage your daily
+# logs). Schema:
+#
+#   {"started_at": "2026-05-04T13:42:11", "anki_date": "2026-05-04",
+#    "last_notify": "2026-05-04T14:12:11"}
+#
+# The file's existence is the source of truth: present means a session is
+# running, absent means none.
+
+def load_active_session():
+    if not os.path.exists(ACTIVE_SESSION_FILE):
+        return None
+    try:
+        with open(ACTIVE_SESSION_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return None
+
+
+def save_active_session(session):
+    try:
+        with open(ACTIVE_SESSION_FILE, "w", encoding="utf-8") as f:
+            json.dump(session, f, indent=2, ensure_ascii=False)
+    except IOError as e:
+        showInfo(f"Could not save active session: {e}")
+
+
+def clear_active_session():
+    if os.path.exists(ACTIVE_SESSION_FILE):
+        try:
+            os.remove(ACTIVE_SESSION_FILE)
+        except OSError:
+            pass
 
 
 # ---------- Anki integration ----------
@@ -131,6 +171,216 @@ def get_study_minutes_for_date(date_str):
         return 0.0
 
 
+def get_study_minutes_in_window(start_dt, end_dt):
+    """Actual Anki study time in minutes between two datetimes."""
+    if mw.col is None:
+        return 0.0
+    start_ms = int(start_dt.timestamp() * 1000)
+    end_ms = int(end_dt.timestamp() * 1000)
+    try:
+        total_ms = mw.col.db.scalar(
+            "SELECT SUM(time) FROM revlog WHERE id >= ? AND id < ?",
+            start_ms, end_ms,
+        ) or 0
+        return total_ms / 1000.0 / 60.0
+    except Exception:
+        return 0.0
+
+
+# ---------- Live session tracker ----------
+#
+# LiveTracker is a singleton that owns the running-session state. The Qt
+# widgets (statusbar label, dialogs) are observers — they call get_state()
+# and a 1-second QTimer to keep their UI fresh. State changes go through
+# tracker methods (start, stop) which fire callbacks so observers can refresh.
+
+class LiveTracker:
+    NOTIFY_INTERVAL_MIN = 30
+
+    def __init__(self):
+        self._listeners = []
+        self._tick_timer = QTimer()
+        self._tick_timer.setInterval(1000)  # 1 Hz
+        self._tick_timer.timeout.connect(self._on_tick)
+
+    def add_listener(self, fn):
+        """Register a no-arg callback fired whenever the displayed state
+        might change (every second while running, plus start/stop edges)."""
+        if fn not in self._listeners:
+            self._listeners.append(fn)
+
+    def remove_listener(self, fn):
+        if fn in self._listeners:
+            self._listeners.remove(fn)
+
+    def _notify_listeners(self):
+        for fn in list(self._listeners):
+            try:
+                fn()
+            except Exception:
+                pass
+
+    def is_running(self):
+        return load_active_session() is not None
+
+    def start(self, started_at=None):
+        """Start a live session. By default anchored to right now, but a
+        datetime can be passed for back-dated starts (e.g., 'I actually sat
+        down 5 minutes ago')."""
+        if self.is_running():
+            return False
+        now = datetime.now()
+        if started_at is None:
+            started_at = now
+        # Bucket the session to the Anki-day the start time falls in.
+        rollover = get_rollover_hour()
+        anchor = started_at - timedelta(days=1) if started_at.hour < rollover else started_at
+        save_active_session({
+            "started_at": started_at.isoformat(timespec="seconds"),
+            "anki_date": anchor.strftime("%Y-%m-%d"),
+            "last_notify": now.isoformat(timespec="seconds"),
+        })
+        self._tick_timer.start()
+        self._notify_listeners()
+        return True
+
+    def stop(self, silent=False):
+        """End the live session and persist it as a normal timed session.
+        If silent=True (used at app shutdown) no tooltip is shown."""
+        sess = load_active_session()
+        if sess is None:
+            self._tick_timer.stop()
+            return None
+        try:
+            started = datetime.fromisoformat(sess["started_at"])
+        except (KeyError, ValueError):
+            clear_active_session()
+            self._tick_timer.stop()
+            self._notify_listeners()
+            return None
+
+        end = datetime.now()
+        minutes = max(0, (end - started).total_seconds() / 60.0)
+
+        # Bucket to the Anki-day the session *started* on. If the user
+        # studied across the rollover boundary we still attribute the whole
+        # block to the start day; the alternative — splitting in two — would
+        # surprise people who logged a single sitting.
+        date_str = sess.get("anki_date") or today_anki_date()
+
+        if minutes >= 0.5:  # ignore accidental clicks under 30 seconds
+            new_session = {
+                "start": started.strftime("%H:%M"),
+                "end": end.strftime("%H:%M"),
+                "minutes": round(minutes, 1),
+            }
+            sessions = get_sessions_for_date(date_str)
+            sessions.append(new_session)
+            write_sessions_for_date(date_str, sessions)
+
+        clear_active_session()
+        self._tick_timer.stop()
+        self._notify_listeners()
+
+        if not silent:
+            tooltip(f"Saved session: {minutes:.1f} min on {date_str}")
+        return minutes
+
+    def ensure_timer_for_loaded_session(self):
+        """Called at profile-load: if a session file survived a previous
+        run, decide what to do with it. Per user preference: auto-stop and
+        save. We treat the session as ending NOW (when Anki was reopened),
+        i.e. duration = now - started_at."""
+        sess = load_active_session()
+        if sess is None:
+            return
+        try:
+            started = datetime.fromisoformat(sess["started_at"])
+        except (KeyError, ValueError):
+            clear_active_session()
+            return
+        # Cap recovered sessions at 24h — anything longer is almost
+        # certainly Anki being closed for days, not a real session.
+        elapsed = datetime.now() - started
+        if elapsed.total_seconds() > 24 * 3600:
+            clear_active_session()
+            tooltip("Discarded a stale running session (> 24 h old)")
+            return
+        # Save what was tracked so far, silently.
+        self.stop(silent=True)
+        tooltip(f"Recovered an unfinished session ({elapsed.total_seconds()/60:.0f} min) — saved")
+
+    def get_state(self):
+        """Snapshot of the running session for UI rendering. Returns None
+        when no session is active."""
+        sess = load_active_session()
+        if sess is None:
+            return None
+        try:
+            started = datetime.fromisoformat(sess["started_at"])
+        except (KeyError, ValueError):
+            return None
+        now = datetime.now()
+        elapsed_min = max(0, (now - started).total_seconds() / 60.0)
+        active_min = get_study_minutes_in_window(started, now)
+        eff = (active_min / elapsed_min * 100) if elapsed_min > 0 else None
+        return {
+            "started": started,
+            "elapsed_min": elapsed_min,
+            "active_min": active_min,
+            "efficiency": eff,
+            "anki_date": sess.get("anki_date"),
+        }
+
+    # ----- internal: tick handler -----
+
+    def _on_tick(self):
+        # Fire visual updates regardless of whether a notification is due.
+        self._notify_listeners()
+
+        # Notification logic — only if enabled and 30 minutes have passed
+        # since the last notification (or session start).
+        if not get_config().get("notify_every_30min", True):
+            return
+        sess = load_active_session()
+        if sess is None:
+            self._tick_timer.stop()
+            return
+        try:
+            last = datetime.fromisoformat(sess.get("last_notify", sess["started_at"]))
+        except (KeyError, ValueError):
+            return
+        now = datetime.now()
+        if (now - last).total_seconds() < self.NOTIFY_INTERVAL_MIN * 60:
+            return
+
+        # Time for a check-in. Update the last-notify timestamp first so a
+        # slow tooltip doesn't accidentally fire twice.
+        sess["last_notify"] = now.isoformat(timespec="seconds")
+        save_active_session(sess)
+
+        state = self.get_state()
+        if state is None:
+            return
+        eff_str = f"{state['efficiency']:.0f}%" if state["efficiency"] is not None else "—"
+        tooltip(
+            f"⏱ Efficiency check-in — studying for {state['elapsed_min']:.0f} min, "
+            f"{state['active_min']:.1f} min in Anki ({eff_str})",
+            period=6000,
+        )
+
+
+# Module-level singleton. Created lazily so test imports don't need a Qt
+# event loop.
+_tracker_instance = None
+
+def get_tracker():
+    global _tracker_instance
+    if _tracker_instance is None:
+        _tracker_instance = LiveTracker()
+    return _tracker_instance
+
+
 # ---------- Session helpers ----------
 
 def compute_attempted_minutes(entry):
@@ -169,19 +419,25 @@ def get_sessions_for_date(date_str):
 def write_sessions_for_date(date_str, sessions):
     """Persist a list of sessions for a date. Removes the day entry entirely
     if the list is empty. Always also writes the computed 'attempted' total
-    so that legacy readers (and simpler exports) keep working."""
+    so that legacy readers (and simpler exports) keep working.
+
+    Also pings tracker listeners so any open statusbar widgets refresh
+    their daily totals immediately."""
     data = load_data()
     if not sessions:
         if date_str in data:
             del data[date_str]
         save_data(data)
-        return
-    total = sum(s.get("minutes", 0) for s in sessions if isinstance(s, dict))
-    data[date_str] = {
-        "sessions": sessions,
-        "attempted": total,
-    }
-    save_data(data)
+    else:
+        total = sum(s.get("minutes", 0) for s in sessions if isinstance(s, dict))
+        data[date_str] = {
+            "sessions": sessions,
+            "attempted": total,
+        }
+        save_data(data)
+    # Notify any UI observers (statusbar) that daily totals may have changed.
+    if _tracker_instance is not None:
+        _tracker_instance._notify_listeners()
 
 
 def compute_session_minutes(start_str, end_str):
@@ -589,6 +845,8 @@ def show_import_dialog():
     merged = dict(existing)
     merged.update(incoming)
     save_data(merged)
+    if _tracker_instance is not None:
+        _tracker_instance._notify_listeners()
 
     tooltip(f"Imported {len(incoming)} entries ({new_count} new, {overlap} updated)")
 
@@ -1127,10 +1385,246 @@ def _add_toolbar_link(links, toolbar):
 gui_hooks.top_toolbar_did_init_links.append(_add_toolbar_link)
 
 
+# ---------- Statusbar widget for the live session ----------
+#
+# Two pieces, both pinned to Anki's bottom-right statusbar:
+#  1. A small Start/Stop button — always visible.
+#  2. A label with live session stats — only visible while a session is
+#     running. Shows elapsed time / Anki minutes so far / efficiency
+#     percentage (the same look from before this iteration).
+
+_statusbar_button = None
+_statusbar_label = None
+_start_action_ref = None  # menu action whose label switches Start ↔ Stop
+
+
+def _eff_colour(eff):
+    if eff is None:
+        return "#8a8d99"
+    cfg = get_config()
+    if eff >= cfg.get("good_threshold", 70):
+        return "#5cb86a"
+    if eff >= cfg.get("warn_threshold", 45):
+        return "#e89545"
+    return "#d65555"
+
+
+def _format_elapsed(minutes):
+    if minutes >= 60:
+        h = int(minutes // 60)
+        m = int(minutes % 60)
+        return f"{h}h{m:02d}"
+    return f"{int(minutes)}:{int((minutes - int(minutes)) * 60):02d}"
+
+
+def _refresh_statusbar():
+    """Pull state from the tracker and redraw both widgets."""
+    global _statusbar_button, _statusbar_label, _start_action_ref
+    if _statusbar_button is None or _statusbar_label is None:
+        return
+
+    state = get_tracker().get_state()
+    running = state is not None
+
+    # --- Button: always visible, compact, label flips on state ---
+    _statusbar_button.setText("⏹" if running else "▶")
+    _statusbar_button.setToolTip(
+        "Stop the live session and save it"
+        if running else "Start a live session"
+    )
+
+    # --- Label: visible only while running, with the original session stats ---
+    if not running:
+        # When idle, the label still shows — but as a low-contrast hint
+        # explaining what the button does. Without this the lone ▶ icon
+        # is mysterious for first-time users.
+        _statusbar_label.setText(
+            '<span style="color:#8a8d99; font-size:11px;">'
+            'Start session'
+            '</span>'
+        )
+        _statusbar_label.setVisible(True)
+    else:
+        eff = state["efficiency"]
+        eff_str = f"{eff:.0f}%" if eff is not None else "—"
+        colour = _eff_colour(eff)
+        _statusbar_label.setText(
+            f'⏱ <b>{_format_elapsed(state["elapsed_min"])}</b>'
+            f' &nbsp;·&nbsp; {state["active_min"]:.1f} min Anki'
+            f' &nbsp;·&nbsp; <b style="color:{colour}">{eff_str}</b>'
+        )
+        _statusbar_label.setVisible(True)
+
+    # --- Sync the menu action label ---
+    if _start_action_ref is not None:
+        _start_action_ref.setText("⏹ Stop session" if running else "▶ Start session…")
+
+
+def _install_statusbar():
+    """Create the statusbar widgets and register them with the tracker."""
+    global _statusbar_button, _statusbar_label
+    if _statusbar_button is not None:
+        return
+    sb = mw.statusBar()
+    if sb is None:
+        return
+
+    button = QPushButton("▶")
+    button.setFlat(True)
+    button.setCursor(Qt.CursorShape.PointingHandCursor)
+    # Compact: tight padding, fixed-ish width so it doesn't shift when
+    # the icon switches between ▶ and ⏹.
+    button.setFixedWidth(28)
+    button.setStyleSheet(
+        "QPushButton { padding: 1px 0; border: 1px solid rgba(128,128,128,0.30); "
+        "border-radius: 3px; font-size: 11px; } "
+        "QPushButton:hover { background: rgba(128,128,128,0.15); }"
+    )
+    button.clicked.connect(toggle_live_session)
+
+    label = QLabel()
+    label.setTextFormat(Qt.TextFormat.RichText)
+    label.setStyleSheet("QLabel { padding: 0 8px; }")
+    label.setVisible(False)
+
+    sb.addPermanentWidget(button)
+    sb.addPermanentWidget(label)
+    _statusbar_button = button
+    _statusbar_label = label
+    get_tracker().add_listener(_refresh_statusbar)
+
+
+# ---------- Start / stop actions ----------
+
+class StartSessionDialog(QDialog):
+    """Tiny dialog asked when the user clicks Start. Defaults to the current
+    time but can be back-dated up to 6 hours, so a user who started
+    studying 5 minutes ago and only now hit Start can correct that."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Start session")
+        self.resize(300, 120)
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Started at:"))
+        self.time_edit = QTimeEdit(QTime.currentTime())
+        self.time_edit.setDisplayFormat("HH:mm")
+        # Allow seconds-precision behind the scenes but show only H:M.
+        # Maximum is "now" — back-dating only, no future timestamps.
+        self.time_edit.setMaximumTime(QTime.currentTime())
+        row.addWidget(self.time_edit)
+        row.addStretch()
+        layout.addLayout(row)
+
+        self.hint = QLabel("Defaults to right now. Adjust if you started a few minutes ago.")
+        self.hint.setStyleSheet("color: rgba(128,128,128,0.85); font-size: 11px;")
+        self.hint.setWordWrap(True)
+        layout.addWidget(self.hint)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Start")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.setLayout(layout)
+
+    def get_start_datetime(self):
+        """Return today's date combined with the chosen time. If the chosen
+        time is later than 'now' (e.g. user picked 23:00 and it's 00:30),
+        treat it as belonging to yesterday so the elapsed duration is
+        positive and small rather than ~23 hours."""
+        now = datetime.now()
+        chosen = self.time_edit.time()
+        candidate = now.replace(
+            hour=chosen.hour(), minute=chosen.minute(),
+            second=0, microsecond=0,
+        )
+        if candidate > now:
+            candidate -= timedelta(days=1)
+        return candidate
+
+
+def toggle_live_session():
+    """Single menu entry that starts or stops the session depending on
+    current state. Connected to a keyboard shortcut for fast access."""
+    tracker = get_tracker()
+    if tracker.is_running():
+        tracker.stop()
+    else:
+        _prompt_and_start()
+
+
+def _prompt_and_start():
+    """Show the start-time dialog and start the session if confirmed."""
+    dialog = StartSessionDialog(mw)
+    if dialog.exec():
+        started_at = dialog.get_start_datetime()
+        get_tracker().start(started_at=started_at)
+        # Quick confirmation: show the chosen time so a back-dated start
+        # is clearly acknowledged.
+        tooltip(f"Live session started — anchored to {started_at.strftime('%H:%M')}")
+
+
+def start_live_session():
+    if get_tracker().is_running():
+        showInfo("A session is already running. Stop it first.")
+        return
+    _prompt_and_start()
+
+
+def stop_live_session():
+    if not get_tracker().is_running():
+        showInfo("No session is currently running.")
+        return
+    get_tracker().stop()
+
+
+# ---------- Profile lifecycle ----------
+
+def _on_profile_open():
+    """Runs after the user's profile loads. Creates the statusbar widget,
+    handles a session that survived a previous shutdown, and refreshes the
+    UI to match current state."""
+    _install_statusbar()
+    get_tracker().ensure_timer_for_loaded_session()
+    _refresh_statusbar()
+
+
+def _on_profile_close():
+    """Runs as Anki is shutting down. Per user preference: auto-stop and
+    save whatever was tracked so far."""
+    if get_tracker().is_running():
+        get_tracker().stop(silent=True)
+
+
+gui_hooks.profile_did_open.append(_on_profile_open)
+gui_hooks.profile_will_close.append(_on_profile_close)
+
+
 # ---------- Menu setup ----------
 
 def setup_menu():
+    global _start_action_ref
     menu = mw.form.menuTools.addMenu("Efficiency Tracker")
+
+    # Live session toggle — label switches based on state. Refreshed by
+    # _refresh_statusbar() which the tracker calls every second while
+    # running and on every state edge.
+    action_toggle = QAction("▶ Start session…", mw)
+    action_toggle.setShortcut("Ctrl+Shift+R")
+    qconnect(action_toggle.triggered, toggle_live_session)
+    menu.addAction(action_toggle)
+    _start_action_ref = action_toggle
+
+    menu.addSeparator()
 
     action_input = QAction("➕ Enter study time…", mw)
     action_input.setShortcut("Ctrl+Shift+E")

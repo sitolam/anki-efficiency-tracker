@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] — 2026-05-04
+
+### Added
+- **Live sessions** — track efficiency from a chosen moment in time and
+  save the result as a regular session when you stop. Start via the
+  **▶** button in Anki's bottom statusbar, the Tools menu, or
+  `Ctrl+Shift+R`. The same shortcut stops a running session
+- **Start-time dialog** — clicking ▶ opens a small dialog letting you
+  pick the session's start time. Defaults to right now, can be
+  back-dated for when you only remember to start tracking after the
+  fact (also handles the "I started at 23:30 yesterday and clicked at
+  00:15 today" edge case)
+- **Statusbar widget** — a compact ▶ / ⏹ button always sits in Anki's
+  bottom statusbar. While a session is running, a label next to it
+  shows live elapsed time, Anki minutes so far, and a colour-coded
+  efficiency percentage that updates every second. While idle the
+  label shows a subtle "Start session" hint
+- **30-minute check-in notifications** — gentle tooltip every 30 minutes
+  during a live session, summarising your current efficiency.
+  Configurable via the new `notify_every_30min` config key
+- **Crash / shutdown recovery** — if Anki is closed (or crashes) while a
+  session is running, the next time you launch Anki the session is
+  auto-stopped and the tracked time is saved to the day it started.
+  Stale sessions older than 24 hours are discarded
+
+### Changed
+- New `active_session.json` file in the addon directory holds the running
+  session state. It's the source of truth for whether a session is active
+  and is automatically removed when the session stops
+
 ## [1.2.1] — 2026-05-04
 
 ### Fixed

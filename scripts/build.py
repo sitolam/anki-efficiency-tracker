@@ -18,7 +18,7 @@ SRC = ROOT / "src" / "efficiency_tracker"
 DIST = ROOT / "dist"
 OUT = DIST / "efficiency_tracker.ankiaddon"
 
-EXCLUDE_NAMES = {"__pycache__", "user_data.json", "meta.json", ".DS_Store"}
+EXCLUDE_NAMES = {"__pycache__", "user_data.json", "active_session.json", "meta.json", ".DS_Store"}
 EXCLUDE_SUFFIXES = {".pyc"}
 
 

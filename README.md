@@ -32,6 +32,10 @@ your recent history.
 
 ## Features
 
+- ⏱ **Live sessions** — start a timer with one click and watch your
+  efficiency update live in the Anki statusbar. 30-minute check-in
+  tooltips help you stay on track. Crash-recovers gracefully if Anki
+  is closed mid-session
 - ➕ **Log study time as sessions** — add multiple time blocks per day
   (09:00 → 10:00, 14:30 → 15:00, etc.) or just a duration in minutes
 - 📊 Dashboard with today's efficiency, 7-day average, and 30-day average
@@ -87,10 +91,29 @@ these actions:
 
 | Action                       | Shortcut         | What it does                                                |
 |------------------------------|------------------|-------------------------------------------------------------|
+| ▶ Start / ⏹ Stop session    | `Ctrl+Shift+R`   | Toggle a live session — see the statusbar widget for live efficiency |
 | ➕ Enter study time…        | `Ctrl+Shift+E`   | Open the per-day session log (add/remove timed sessions)   |
 | 📊 Show statistics…         | `Ctrl+Shift+S`   | Open the dashboard                                          |
 | 📤 Export data…             |                  | Save your attempted-time entries to a JSON file             |
 | 📥 Import data…             |                  | Load entries from a JSON export (merged with existing data) |
+
+### Running a live session
+
+Hit `Ctrl+Shift+R` (or click the **▶** button in Anki's bottom statusbar,
+or pick **▶ Start session…** from the Tools menu) when you sit down to
+study. A small dialog asks when you started — defaults to right now, but
+you can back-date it if you started 5 minutes ago and only just clicked.
+
+While the session is running, the statusbar shows live elapsed time, Anki
+review time, and a colour-coded efficiency percentage that updates every
+second. Every 30 minutes a tooltip nudges you with the current numbers —
+silenceable via `notify_every_30min` in the config.
+
+Click **⏹** (or hit `Ctrl+Shift+R` again) to stop. The block is saved to
+that day's session list, with the real start and end times.
+
+If Anki is closed while a session is running, the tracker auto-stops it
+on the next launch and saves what was tracked up to that moment.
 
 ### Logging a session
 
@@ -119,6 +142,7 @@ Open **Tools → Add-ons → Efficiency Tracker → Config** to tune:
 | `good_threshold` | `70` | Efficiency % at which the indicator turns green |
 | `warn_threshold` | `45` | Below this %, indicator turns red. Between this and `good_threshold` it's amber |
 | `range_days` | `30` | Time window for the dashboard. One of `7`, `30`, `90`, or `365`. Also changeable from the range dropdown in the dashboard. |
+| `notify_every_30min` | `true` | Show a 30-min check-in tooltip while a live session is running. Set `false` to silence. |
 | `show_toolbar_button` | `true` | Show the "Efficiency" link in Anki's top toolbar (restart Anki after changing) |
 
 ## Cross-device sync (export / import)
