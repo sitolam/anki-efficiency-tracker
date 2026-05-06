@@ -5,6 +5,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.2] — 2026-05-04
+
+### Added
+- **Auto-fill on session start** — if you've already done some Anki
+  reviews today before clicking Start (without logging them), the
+  add-on automatically appends an untimed session covering the gap, so
+  the live session begins from a clean baseline. The auto-fill is
+  rollover-aware and only counts Anki time *before* the chosen start
+  time, so back-dating still works correctly. A start-tooltip
+  acknowledges the auto-log
+- **Under-logging warning** — when adding or editing a session that
+  would still leave the day's total below the actual Anki time, a
+  confirmation dialog shows the gap and asks before saving. The user
+  can always proceed; the warning exists to catch accidental
+  under-logging
+- **Live session reflected on the dashboard** — when a session is
+  running, today's bar in the chart, today's row in the history table,
+  and the summary cards all update once per minute to include the
+  session's elapsed time. The dashboard subscribes to the tracker and
+  refreshes only on integer-minute changes to avoid flicker
+- **Click a session to edit it** — clicking anywhere on a session's
+  label in the input dialog opens the same dialog used to add it, but
+  pre-filled with that session's start, end, and minutes. Saving
+  replaces the existing session in place
+- **Live session shown in the input dialog** — when a session is
+  running, it appears at the top of the sessions list with a blue
+  "● LIVE" accent. Click the row to adjust its start time on the fly,
+  or hit ⏹ to stop and save it without leaving the dialog
+
+### Changed
+- **Efficiency now capped at 100%.** If you study 60 min in Anki but
+  only logged a 30 min session, the dashboard previously showed 200%.
+  It now shows 100%, with the displayed "attempted" value bumped up to
+  match the actual Anki time. The rule is `effective_attempted =
+  max(raw_logged, actual_anki)`. Adding more sessions first "fills in"
+  to that floor; only sessions logged beyond that increase the
+  attempted total visibly. Days with zero logged sessions still show
+  "no data" rather than a free 100%
+- The dashboard's efficiency Y-axis is fixed at 100% (no more dynamic
+  rescaling for outliers, since outliers are now impossible)
+
 ## [1.3.1] — 2026-05-04
 
 ### Changed

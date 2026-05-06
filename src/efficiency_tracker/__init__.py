@@ -13,8 +13,8 @@ from aqt.qt import (
     QAction, QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QDoubleSpinBox, QDialogButtonBox, QDateEdit, QDate, Qt,
     QWebEngineView, QTimer, QComboBox, QFileDialog,
-    QTimeEdit, QTime, QSpinBox, QRadioButton, QScrollArea, QWidget,
-    QFormLayout,
+    QTimeEdit, QTime, QSpinBox, QRadioButton, QButtonGroup,
+    QScrollArea, QWidget, QFormLayout,
 )
 from aqt.utils import qconnect, tooltip, showInfo, askUser
 
@@ -124,16 +124,27 @@ def get_rollover_hour():
             return 4
 
 
-def today_anki_date():
-    """Return the current Anki-day as a YYYY-MM-DD string, honouring the
-    rollover hour. If it's currently 02:30 and rollover is 4 AM, the
-    Anki-day is still yesterday's date — exactly how Anki itself counts
-    reviews."""
-    now = datetime.now()
+def anki_date_for(dt):
+    """The Anki-day a given datetime belongs to (rollover-aware). At 02:30
+    with rollover=4, this returns yesterday's calendar date — exactly how
+    Anki itself counts reviews from that moment."""
     rollover = get_rollover_hour()
-    if now.hour < rollover:
-        now = now - timedelta(days=1)
-    return now.strftime("%Y-%m-%d")
+    if dt.hour < rollover:
+        dt = dt - timedelta(days=1)
+    return dt.strftime("%Y-%m-%d")
+
+
+def today_anki_date():
+    """Convenience: Anki-day for right now."""
+    return anki_date_for(datetime.now())
+
+
+def anki_day_start(date_str):
+    """The wall-clock datetime at which the given Anki-day begins (i.e. the
+    rollover hour on that calendar date)."""
+    rollover = get_rollover_hour()
+    dt = datetime.strptime(date_str, "%Y-%m-%d")
+    return dt.replace(hour=rollover, minute=0, second=0, microsecond=0)
 
 
 def qdate_for_anki_today():
@@ -232,12 +243,9 @@ class LiveTracker:
         now = datetime.now()
         if started_at is None:
             started_at = now
-        # Bucket the session to the Anki-day the start time falls in.
-        rollover = get_rollover_hour()
-        anchor = started_at - timedelta(days=1) if started_at.hour < rollover else started_at
         save_active_session({
             "started_at": started_at.isoformat(timespec="seconds"),
-            "anki_date": anchor.strftime("%Y-%m-%d"),
+            "anki_date": anki_date_for(started_at),
             "last_notify": now.isoformat(timespec="seconds"),
         })
         self._tick_timer.start()
@@ -402,6 +410,34 @@ def compute_attempted_minutes(entry):
     return entry.get("attempted", 0)
 
 
+def compute_effective_attempted(raw_attempted, actual_minutes):
+    """How many minutes of "attempted" we *display*. Capped from below by
+    the actual Anki time so efficiency can't exceed 100%.
+
+    Rationale: if you studied 60 min in Anki but only logged a 30 min
+    session, you didn't *attempt less than you actually studied* — you
+    just forgot to log enough. The efficiency you see is `actual /
+    effective`, which becomes `actual / actual = 100%` until your logged
+    sessions exceed your Anki time, at which point the ratio starts to
+    drop honestly.
+
+    A day with no logged sessions (raw == 0) returns 0 so we can show
+    "no data" rather than pretending all-Anki-was-attempted.
+    """
+    if raw_attempted <= 0:
+        return 0
+    return max(raw_attempted, actual_minutes)
+
+
+def compute_efficiency_percent(raw_attempted, actual_minutes):
+    """Returns None when there is no attempted time logged for the day.
+    Otherwise the percentage, always between 0 and 100."""
+    effective = compute_effective_attempted(raw_attempted, actual_minutes)
+    if effective <= 0:
+        return None
+    return min(100.0, actual_minutes / effective * 100)
+
+
 def get_sessions_for_date(date_str):
     """Return the list of sessions for a date. Auto-converts a legacy
     'attempted' entry to a single untimed session for editing purposes."""
@@ -454,25 +490,78 @@ def compute_session_minutes(start_str, end_str):
     return duration
 
 
-# ---------- Add-session dialog ----------
+def autofill_unaccounted_anki_time(date_str, before_dt):
+    """If there's Anki review time on `date_str` from the day's start up to
+    `before_dt` that isn't yet covered by logged sessions, append an
+    untimed session for the gap and return its size (in minutes). Returns
+    0 if no fill happened.
+
+    Used at the start of a live session to make explicit any "I forgot to
+    log earlier today" Anki time, so the user's effective attempted total
+    is honest from the moment the live session begins."""
+    day_start = anki_day_start(date_str)
+    anki_before = get_study_minutes_in_window(day_start, before_dt)
+    already_logged = sum(
+        s.get("minutes", 0) for s in get_sessions_for_date(date_str)
+    )
+    gap = anki_before - already_logged
+    # Only fill gaps of at least 30 seconds — anything smaller is rounding
+    # noise and would create distractingly tiny sessions.
+    if gap < 0.5:
+        return 0
+    sessions = get_sessions_for_date(date_str)
+    # The auto flag tells the input dialog to render this row distinctly
+    # and skip the click-to-edit affordance — auto-fills don't have a
+    # clear semantic for editing, just delete-and-redo.
+    sessions.append({"minutes": round(gap, 1), "auto": True})
+    write_sessions_for_date(date_str, sessions)
+    return gap
+
+
+def projected_total_after_change(date_str, replaced_idx, new_session):
+    """What the day's total logged minutes would be if `new_session` were
+    added (replaced_idx=None) or replaced an existing one (replaced_idx=
+    int). Includes the live session's elapsed minutes if it belongs to
+    `date_str`. Used to drive the under-logging warning."""
+    sessions = get_sessions_for_date(date_str)
+    total = 0.0
+    for i, s in enumerate(sessions):
+        if i == replaced_idx:
+            continue
+        total += s.get("minutes", 0)
+    total += new_session.get("minutes", 0)
+    state = get_tracker().get_state()
+    if state is not None and state["anki_date"] == date_str:
+        total += state["elapsed_min"]
+    return total
+
+
+# ---------- Add / edit session dialog ----------
 
 class AddSessionDialog(QDialog):
-    """Sub-dialog for adding a single session — either timed (start/end)
-    or untimed (just a duration in minutes)."""
+    """Sub-dialog for adding or editing a single session — either timed
+    (start/end) or untimed (just a duration in minutes). Pass `initial=
+    {minutes, ?start, ?end}` to pre-fill for editing."""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, initial=None):
         super().__init__(parent)
-        self.setWindowTitle("Add study session")
+        self.setWindowTitle("Edit study session" if initial else "Add study session")
         self.resize(360, 240)
 
         layout = QVBoxLayout()
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(10)
 
-        # Mode selector
+        # Mode selector — wrap in a QButtonGroup so checking one always
+        # unchecks the other. Without this, calling setChecked(True) on
+        # one radio (e.g. when pre-filling for edit) doesn't reliably
+        # uncheck its sibling and you end up with both visually selected.
         self.timed_radio = QRadioButton("Timed (from / to)")
         self.timed_radio.setChecked(True)
         self.bulk_radio = QRadioButton("Just minutes (no specific times)")
+        self._mode_group = QButtonGroup(self)
+        self._mode_group.addButton(self.timed_radio)
+        self._mode_group.addButton(self.bulk_radio)
         layout.addWidget(self.timed_radio)
         layout.addWidget(self.bulk_radio)
 
@@ -505,6 +594,27 @@ class AddSessionDialog(QDialog):
         layout.addWidget(self.bulk_widget)
         self.bulk_widget.hide()
 
+        # Apply initial values for edit mode.
+        if initial is not None:
+            if "start" in initial and "end" in initial:
+                self.timed_radio.setChecked(True)
+                try:
+                    sh, sm = map(int, initial["start"].split(":"))
+                    eh, em = map(int, initial["end"].split(":"))
+                    self.start_edit.setTime(QTime(sh, sm))
+                    self.end_edit.setTime(QTime(eh, em))
+                except (ValueError, AttributeError):
+                    pass
+            else:
+                self.bulk_radio.setChecked(True)
+                m = initial.get("minutes", 30)
+                try:
+                    self.bulk_spin.setValue(int(m))
+                except (TypeError, ValueError):
+                    pass
+            # Reflect the radio state in widget visibility.
+            self._on_mode_changed()
+
         # Wire up reactivity
         self.timed_radio.toggled.connect(self._on_mode_changed)
         self.start_edit.timeChanged.connect(self._update_duration)
@@ -515,6 +625,8 @@ class AddSessionDialog(QDialog):
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
+        if initial is not None:
+            buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Save")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -553,14 +665,48 @@ class AddSessionDialog(QDialog):
 
 # ---------- Input dialog ----------
 
+class _ClickableArea(QLabel):
+    """A clickable rich-text label. Used for the session rows in the input
+    dialog so the whole label area opens the edit dialog. We can't use a
+    QPushButton because Qt's button rendering doesn't support rich text
+    (no inline bold / colour). A QLabel does, but doesn't fire clicks by
+    default — so we override mousePressEvent."""
+
+    def __init__(self, text="", on_click=None, tooltip="", parent=None):
+        super().__init__(text, parent)
+        self._on_click = on_click
+        self.setTextFormat(Qt.TextFormat.RichText)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        if tooltip:
+            self.setToolTip(tooltip)
+        # Slight padding + hover background so it visually behaves like a
+        # button. Without this, "click anywhere on the label" feels lucky
+        # rather than designed.
+        self.setStyleSheet(
+            "QLabel { padding: 6px 10px; border-radius: 4px; } "
+            "QLabel:hover { background: rgba(128,128,128,0.18); }"
+        )
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton and self._on_click:
+            self._on_click()
+        super().mousePressEvent(ev)
+
+
 class InputDialog(QDialog):
-    """Main dialog: shows the day's sessions, allows add/remove. Changes
+    """Main dialog: shows the day's sessions with add / edit / remove
+    actions, plus a row for the live session if one is running. Changes
     are saved immediately (no separate Save button)."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Efficiency — log study time")
         self.resize(520, 500)
+
+        # Throttle live refreshes the same way StatsDialog does — once per
+        # displayed-minute is plenty for "8 min running" → "9 min running".
+        self._last_live_int_min = None
+        self._listener_fn = self._on_tracker_tick
 
         layout = QVBoxLayout()
         layout.setContentsMargins(16, 16, 16, 16)
@@ -626,6 +772,19 @@ class InputDialog(QDialog):
         self.setLayout(layout)
         self.refresh()
 
+        get_tracker().add_listener(self._listener_fn)
+
+    def closeEvent(self, ev):
+        get_tracker().remove_listener(self._listener_fn)
+        super().closeEvent(ev)
+
+    def _on_tracker_tick(self):
+        state = get_tracker().get_state()
+        cur = int(state["elapsed_min"]) if state else None
+        if cur != self._last_live_int_min:
+            self._last_live_int_min = cur
+            self.refresh()
+
     def current_date_str(self):
         return self.date_edit.date().toString("yyyy-MM-dd")
 
@@ -640,7 +799,15 @@ class InputDialog(QDialog):
         date_str = self.current_date_str()
         sessions = get_sessions_for_date(date_str)
 
-        if not sessions:
+        # If a live session is running on the same Anki-day as we're viewing,
+        # show it at the top of the list — distinct visual treatment, with
+        # its own click-to-edit-start-time and ⏹ stop-and-save buttons.
+        state = get_tracker().get_state()
+        live_here = state is not None and state["anki_date"] == date_str
+        if live_here:
+            self.sessions_layout.addWidget(self._make_live_session_row(state))
+
+        if not sessions and not live_here:
             empty = QLabel("No sessions logged yet for this day.\nClick ‘Add session’ above to log one.")
             empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
             empty.setStyleSheet("color: rgba(128,128,128,0.85); padding: 30px; font-style: italic;")
@@ -655,40 +822,112 @@ class InputDialog(QDialog):
     def _make_session_row(self, session, idx):
         wrap = QWidget()
         row = QHBoxLayout(wrap)
-        row.setContentsMargins(10, 6, 8, 6)
-        row.setSpacing(8)
+        row.setContentsMargins(2, 2, 2, 2)
+        row.setSpacing(6)
 
+        is_auto = session.get("auto") is True
         minutes = session.get("minutes", 0)
-        if "start" in session and "end" in session:
-            text = f"<b>{session['start']}</b> → <b>{session['end']}</b>  ·  {minutes:.0f} min"
+
+        if is_auto:
+            # Auto-filled by the addon when starting a live session, to
+            # cover Anki time done before tracking began. Visually
+            # distinct (amber accent), and only deletable — there's no
+            # clean semantic for editing a "we found these minutes for
+            # you" entry; if it's wrong, just remove it.
+            wrap.setStyleSheet(
+                "background: rgba(232, 149, 69, 0.10); "
+                "border: 1px solid rgba(232, 149, 69, 0.40); "
+                "border-radius: 4px;"
+            )
+            text = (
+                f'<span style="color:#e89545; font-weight:bold;">AUTO</span>'
+                f' &nbsp; <span style="color:#8a8d99">earlier Anki activity</span>'
+                f'  ·  {minutes:.0f} min'
+            )
+            label = QLabel(text)
+            label.setTextFormat(Qt.TextFormat.RichText)
+            label.setStyleSheet("QLabel { padding: 6px 10px; }")
+            label.setToolTip(
+                "Auto-logged when you started a live session, to cover Anki "
+                "time done before tracking began. Editing isn't supported "
+                "— remove and re-add if needed."
+            )
+            row.addWidget(label, 1)
         else:
-            text = f"<i>Untimed</i>  ·  {minutes:.0f} min"
-        label = QLabel(text)
-        label.setTextFormat(Qt.TextFormat.RichText)
-        row.addWidget(label)
-        row.addStretch()
+            if "start" in session and "end" in session:
+                text = f"<b>{session['start']}</b> → <b>{session['end']}</b>  ·  {minutes:.0f} min"
+            else:
+                text = f"<i>Untimed</i>  ·  {minutes:.0f} min"
+            # The label is itself a clickable area so the whole row opens
+            # the edit dialog — easier to hit than a tiny pencil icon.
+            edit_btn = _ClickableArea(
+                text=text,
+                on_click=lambda i=idx: self.on_edit_session(i),
+                tooltip="Click to edit this session",
+            )
+            row.addWidget(edit_btn, 1)
 
-        btn = QPushButton("✕")
-        btn.setFixedWidth(32)
-        btn.setToolTip("Remove this session")
-        btn.clicked.connect(lambda _=False, i=idx: self.on_remove_session(i))
-        row.addWidget(btn)
+        remove_btn = QPushButton("✕")
+        remove_btn.setFixedWidth(32)
+        remove_btn.setToolTip("Remove this session")
+        remove_btn.clicked.connect(lambda _=False, i=idx: self.on_remove_session(i))
+        row.addWidget(remove_btn)
 
-        if idx % 2 == 0:
+        # Zebra-striping for non-auto rows only — the auto styling already
+        # provides its own distinct background.
+        if not is_auto and idx % 2 == 0:
             wrap.setStyleSheet("background: rgba(128,128,128,0.06); border-radius: 4px;")
+        return wrap
+
+    def _make_live_session_row(self, state):
+        wrap = QWidget()
+        wrap.setStyleSheet(
+            "background: rgba(107, 164, 255, 0.12); "
+            "border: 1px solid rgba(107, 164, 255, 0.45); "
+            "border-radius: 4px;"
+        )
+        row = QHBoxLayout(wrap)
+        row.setContentsMargins(2, 2, 2, 2)
+        row.setSpacing(6)
+
+        elapsed = state["elapsed_min"]
+        started = state["started"].strftime("%H:%M")
+        text = (
+            f'<span style="color:#6ba4ff; font-weight:bold;">● LIVE</span>'
+            f' &nbsp; <b>{started}</b> → <i>now</i>  ·  {elapsed:.0f} min'
+        )
+
+        edit_btn = _ClickableArea(
+            text=text,
+            on_click=self.on_edit_live_session,
+            tooltip="Click to adjust the start time of this running session",
+        )
+        row.addWidget(edit_btn, 1)
+
+        stop_btn = QPushButton("⏹")
+        stop_btn.setFixedWidth(32)
+        stop_btn.setToolTip("Stop this session and save it")
+        stop_btn.clicked.connect(self.on_stop_live_session)
+        row.addWidget(stop_btn)
+
         return wrap
 
     def _update_stats(self):
         date_str = self.current_date_str()
-        sessions = get_sessions_for_date(date_str)
-        attempted = sum(s.get("minutes", 0) for s in sessions)
+        raw = sum(s.get("minutes", 0) for s in get_sessions_for_date(date_str))
+        # Add the running session's elapsed time if it belongs to this day.
+        state = get_tracker().get_state()
+        if state is not None and state["anki_date"] == date_str:
+            raw += state["elapsed_min"]
         actual = get_study_minutes_for_date(date_str)
+        effective = compute_effective_attempted(raw, actual)
+        eff = compute_efficiency_percent(raw, actual)
+
         msg = (
-            f"Total attempted: <b>{attempted:.0f} min</b>"
+            f"Total attempted: <b>{effective:.0f} min</b>"
             f" &nbsp;·&nbsp; Active in Anki: <b>{actual:.1f} min</b>"
         )
-        if attempted > 0:
-            eff = (actual / attempted) * 100
+        if eff is not None:
             msg += f" &nbsp;·&nbsp; Efficiency: <b>{eff:.1f}%</b>"
         self.stats_label.setText(msg)
 
@@ -700,8 +939,52 @@ class InputDialog(QDialog):
                 showInfo("Session duration must be greater than zero.")
                 return
             date_str = self.current_date_str()
+            if not self._confirm_no_underlogging(date_str, None, session):
+                return
             sessions = get_sessions_for_date(date_str)
             sessions.append(session)
+            write_sessions_for_date(date_str, sessions)
+            self.refresh()
+
+    def _confirm_no_underlogging(self, date_str, replaced_idx, new_session):
+        """If the day's projected total (after this add/edit) would still
+        be less than the actual Anki time, ask the user to confirm. Returns
+        False if the user cancels, True otherwise (including 'no warning
+        needed')."""
+        projected = projected_total_after_change(date_str, replaced_idx, new_session)
+        actual = get_study_minutes_for_date(date_str)
+        # Allow a small tolerance for float rounding — 0.5 min is below the
+        # display granularity anyway.
+        if projected + 0.5 >= actual:
+            return True
+        gap = actual - projected
+        return askUser(
+            f"Anki shows <b>{actual:.0f} min</b> studied today, but with this "
+            f"change your logged sessions would total only <b>{projected:.0f} min</b> — "
+            f"<b>{gap:.0f} min</b> would still be unaccounted for.<br><br>"
+            f"Save this session anyway?",
+            parent=self,
+            title="Under-logged day",
+        )
+
+    def on_edit_session(self, idx):
+        date_str = self.current_date_str()
+        sessions = get_sessions_for_date(date_str)
+        if not (0 <= idx < len(sessions)):
+            return
+        if sessions[idx].get("auto") is True:
+            # Should not happen via normal UI (auto rows aren't clickable),
+            # but guard anyway in case of programmatic invocation.
+            return
+        dialog = AddSessionDialog(self, initial=sessions[idx])
+        if dialog.exec():
+            new_session = dialog.get_session()
+            if new_session is None:
+                showInfo("Session duration must be greater than zero.")
+                return
+            if not self._confirm_no_underlogging(date_str, idx, new_session):
+                return
+            sessions[idx] = new_session
             write_sessions_for_date(date_str, sessions)
             self.refresh()
 
@@ -712,6 +995,30 @@ class InputDialog(QDialog):
             del sessions[idx]
             write_sessions_for_date(date_str, sessions)
             self.refresh()
+
+    def on_edit_live_session(self):
+        """Adjust the start time of a running session in place."""
+        state = get_tracker().get_state()
+        if state is None:
+            return
+        started = state["started"]
+        initial = QTime(started.hour, started.minute)
+        dialog = StartSessionDialog(self, initial_time=initial, edit_mode=True)
+        if dialog.exec():
+            new_start = dialog.get_start_datetime()
+            sess = load_active_session()
+            if sess is None:
+                return
+            sess["started_at"] = new_start.isoformat(timespec="seconds")
+            # Anki-date may shift if the user back-dates across the rollover.
+            sess["anki_date"] = anki_date_for(new_start)
+            save_active_session(sess)
+            get_tracker()._notify_listeners()
+            self.refresh()
+
+    def on_stop_live_session(self):
+        get_tracker().stop()
+        self.refresh()
 
 
 def show_input_dialog():
@@ -763,6 +1070,8 @@ def _filter_valid_entries(raw):
                 if isinstance(s.get("start"), str) and isinstance(s.get("end"), str):
                     clean["start"] = s["start"]
                     clean["end"] = s["end"]
+                if s.get("auto") is True:
+                    clean["auto"] = True
                 clean_sessions.append(clean)
             if clean_sessions:
                 valid[k] = {
@@ -880,13 +1189,25 @@ def build_stats_html():
     # Anki's own statistics would show.
     today_str = today_anki_date()
     today_dt = datetime.strptime(today_str, "%Y-%m-%d")
+
+    # If a live session is running, fold its elapsed time into the matching
+    # day's attempted total so the dashboard ticks up live too.
+    live_state = get_tracker().get_state()
+    live_anki_date = live_state["anki_date"] if live_state else None
+    live_elapsed = live_state["elapsed_min"] if live_state else 0
+
     days = []
     for i in range(num_days - 1, -1, -1):
         d = today_dt - timedelta(days=i)
         date_str = d.strftime("%Y-%m-%d")
-        attempted = compute_attempted_minutes(data.get(date_str, {}))
+        raw_attempted = compute_attempted_minutes(data.get(date_str, {}))
+        if date_str == live_anki_date:
+            raw_attempted += live_elapsed
         actual = get_study_minutes_for_date(date_str)
-        eff = (actual / attempted * 100) if attempted > 0 else None
+        # Display the effective (capped-at-actual) attempted; efficiency
+        # follows the same rule and is therefore always between 0 and 100%.
+        attempted = compute_effective_attempted(raw_attempted, actual)
+        eff = compute_efficiency_percent(raw_attempted, actual)
         days.append({
             "date": date_str,
             "label": d.strftime("%d/%m"),
@@ -976,10 +1297,7 @@ def build_stats_html():
     # Line chart for efficiency
     eff_chart_h = 240
     eff_inner_h = eff_chart_h - pad_t - pad_b
-    eff_y_max = 100
-    max_eff = max([d["efficiency"] for d in days if d["efficiency"] is not None] + [100])
-    if max_eff > 100:
-        eff_y_max = ((int(max_eff) // 25) + 1) * 25
+    eff_y_max = 100  # Efficiency is capped at 100% by definition now.
 
     dots = []
     for i, d in enumerate(days):
@@ -1255,6 +1573,14 @@ class StatsDialog(QDialog):
         self.setWindowTitle("Efficiency Tracker — Statistics")
         self.resize(960, 760)
 
+        # Throttle live refreshes to once per displayed-minute. The tracker
+        # fires the listener every second, but rebuilding HTML that often
+        # would cause the webview to flicker. We re-render on every state
+        # edge (start/stop, dialog edits) plus once per minute while a
+        # session is running.
+        self._last_live_int_min = None
+        self._listener_fn = self._on_tracker_tick
+
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
 
@@ -1303,6 +1629,19 @@ class StatsDialog(QDialog):
 
         layout.addLayout(btn_row)
         self.setLayout(layout)
+
+        get_tracker().add_listener(self._listener_fn)
+
+    def closeEvent(self, ev):
+        get_tracker().remove_listener(self._listener_fn)
+        super().closeEvent(ev)
+
+    def _on_tracker_tick(self):
+        state = get_tracker().get_state()
+        cur = int(state["elapsed_min"]) if state else None
+        if cur != self._last_live_int_min:
+            self._last_live_int_min = cur
+            self.refresh()
 
     def _refresh_theme_label(self):
         cur = get_config().get("theme", "auto")
@@ -1449,17 +1788,14 @@ def _refresh_statusbar():
     saved_attempted = compute_attempted_minutes(data.get(today_str, {}))
     actual_today = get_study_minutes_for_date(today_str)
 
-    if running:
-        attempted_today = saved_attempted + state["elapsed_min"]
-    else:
-        attempted_today = saved_attempted
-
-    eff = (actual_today / attempted_today * 100) if attempted_today > 0 else None
+    raw_attempted = saved_attempted + (state["elapsed_min"] if running else 0)
+    effective = compute_effective_attempted(raw_attempted, actual_today)
+    eff = compute_efficiency_percent(raw_attempted, actual_today)
     eff_str = f"{eff:.0f}%" if eff is not None else "—"
     colour = _eff_colour(eff)
 
     _statusbar_label.setText(
-        f'⏱ <b>{attempted_today:.0f}</b> min attempted'
+        f'⏱ <b>{effective:.0f}</b> min attempted'
         f' &nbsp;·&nbsp; <b>{actual_today:.1f}</b> min Anki'
         f' &nbsp;·&nbsp; <b style="color:{colour}">{eff_str}</b>'
     )
@@ -1508,12 +1844,13 @@ def _install_statusbar():
 
 class StartSessionDialog(QDialog):
     """Tiny dialog asked when the user clicks Start. Defaults to the current
-    time but can be back-dated up to 6 hours, so a user who started
-    studying 5 minutes ago and only now hit Start can correct that."""
+    time but can be back-dated, so a user who started studying 5 minutes
+    ago and only now hit Start can correct that. Also reused for editing
+    the start time of an already-running session."""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, initial_time=None, edit_mode=False):
         super().__init__(parent)
-        self.setWindowTitle("Start session")
+        self.setWindowTitle("Edit start time" if edit_mode else "Start session")
         self.resize(300, 120)
 
         layout = QVBoxLayout()
@@ -1522,16 +1859,19 @@ class StartSessionDialog(QDialog):
 
         row = QHBoxLayout()
         row.addWidget(QLabel("Started at:"))
-        self.time_edit = QTimeEdit(QTime.currentTime())
+        self.time_edit = QTimeEdit(initial_time or QTime.currentTime())
         self.time_edit.setDisplayFormat("HH:mm")
-        # Allow seconds-precision behind the scenes but show only H:M.
         # Maximum is "now" — back-dating only, no future timestamps.
         self.time_edit.setMaximumTime(QTime.currentTime())
         row.addWidget(self.time_edit)
         row.addStretch()
         layout.addLayout(row)
 
-        self.hint = QLabel("Defaults to right now. Adjust if you started a few minutes ago.")
+        if edit_mode:
+            hint_text = "Adjust the moment your current session began."
+        else:
+            hint_text = "Defaults to right now. Adjust if you started a few minutes ago."
+        self.hint = QLabel(hint_text)
         self.hint.setStyleSheet("color: rgba(128,128,128,0.85); font-size: 11px;")
         self.hint.setWordWrap(True)
         layout.addWidget(self.hint)
@@ -1539,7 +1879,9 @@ class StartSessionDialog(QDialog):
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Start")
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText(
+            "Save" if edit_mode else "Start"
+        )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -1573,14 +1915,23 @@ def toggle_live_session():
 
 
 def _prompt_and_start():
-    """Show the start-time dialog and start the session if confirmed."""
+    """Show the start-time dialog, auto-fill any earlier unaccounted Anki
+    time, then start the session if confirmed."""
     dialog = StartSessionDialog(mw)
     if dialog.exec():
         started_at = dialog.get_start_datetime()
+        # If the user already did some Anki today before clicking Start
+        # (without logging it), bookkeep that time as an untimed session
+        # right now, so the live session begins from a clean baseline
+        # and the displayed efficiency stays honest.
+        date_str = anki_date_for(started_at)
+        filled = autofill_unaccounted_anki_time(date_str, started_at)
         get_tracker().start(started_at=started_at)
-        # Quick confirmation: show the chosen time so a back-dated start
-        # is clearly acknowledged.
-        tooltip(f"Live session started — anchored to {started_at.strftime('%H:%M')}")
+
+        msg = f"Live session started — anchored to {started_at.strftime('%H:%M')}"
+        if filled > 0:
+            msg += f" (auto-logged {filled:.0f} min of earlier Anki activity)"
+        tooltip(msg, period=5000)
 
 
 def start_live_session():
